@@ -1,37 +1,62 @@
 from django.contrib import admin
-from .models import *
 
 # Register your models here.
 
-class AuditSheetAdmin(admin.ModelAdmin):
-
-    list_display = [field.name for field in AuditSheet._meta.get_fields()]
-    list_per_page = 20
-    model = AuditSheet
-
-admin.site.register(AuditSheet, AuditSheetAdmin)
+from . models import *
 
 
-class AuditHoursMonitorAdmin(admin.ModelAdmin):
-    list_display = ('id', 'chart_id', 'user', 'recent_audit_snaps', 'audit_start_time', 'audit_end_time')
-    model = AuditHoursMonitor
 
-admin.site.register(AuditHoursMonitor, AuditHoursMonitorAdmin)
+class CQUserAdmin(admin.ModelAdmin):
+    list_display = (
+        'id', 'email', 'first_name', 'last_name', 'role', 'is_active', 'is_deleted', 'created_date', 'updated_date', 'last_login', 'date_joined'
+    )
+    exclude = ('password',)
+    model = CqUser
 
-
-class IndustrtAdmin(admin.ModelAdmin):
-    list_display =  [field.name for field in Industry._meta.get_fields()]
-
-admin.site.register(Industry, IndustrtAdmin)
+admin.site.register(CqUser, CQUserAdmin)
 
 
-class AuditSheetMetricAdmin(admin.ModelAdmin):
-    list_display =  [field.name for field in AuditSheetMetric._meta.get_fields()]
+class SpecialtyAdmin(admin.ModelAdmin):
+    list_display = ('id', 'name', 'users', 'type')
+    list_filter = ('type',)
+    model = Specialty
 
-admin.site.register(AuditSheetMetric, AuditSheetMetricAdmin)
+    def users(self, obj):
+        return " - ".join([f"{user.email} ({user.role})" for user in obj.cqusers.all()])
+
+admin.site.register(Specialty, SpecialtyAdmin)
 
 
-class AuditSheetCommentAdmin(admin.ModelAdmin):
-    list_display =  ['id', 'chart', 'parent' , 'audit_sheet_rows', 'audit_sheet_columns', 'user', 'tagged_user', 'comment', 'commented_at', 'updated_at', 'action',]
+class CqTeamAdmin(admin.ModelAdmin):
 
-admin.site.register(AuditSheetComment, AuditSheetCommentAdmin)
+    list_display = ('id', 'name', 'members_list', 'specialties_list', 'is_active')
+    model = CqTeam
+
+    def members_list(self, obj):
+        return " - ".join([f"{user.email} ({user.role})" for user in obj.members.all()])
+
+    def specialties_list(self, obj):
+        return " - ".join([f"{specialty.name}" for specialty in obj.specialties.all()])
+
+admin.site.register(CqTeam, CqTeamAdmin)
+
+
+class FAQAdmin(admin.ModelAdmin):
+    list_display = ('question', 'answer', 'is_active', 'order' , 'created_at', 'updated_at')
+    model = FAQ
+
+admin.site.register(FAQ, FAQAdmin)
+
+
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ('message', 'sender', 'type', 'created_at', 'is_active', 'reference_chart')
+    model = Notification
+
+admin.site.register(Notification, NotificationAdmin)
+
+
+class NotificationUserAdmin(admin.ModelAdmin):
+    list_display = ('user', 'notification', 'read')
+    model = NotificationUser
+
+admin.site.register(NotificationUser, NotificationUserAdmin)

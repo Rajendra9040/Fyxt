@@ -1,6 +1,6 @@
 from django.apps import AppConfig
 
 
-class AuditsheetConfig(AppConfig):
+class CqusersConfig(AppConfig):
     default_auto_field = 'django.db.models.BigAutoField'
-    name = 'auditsheet'
+    name = 'cqusers'
