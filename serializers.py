@@ -91,7 +91,7 @@ class AuditorDropdownSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = CqUser
-        fields = ('id', 'first_name', 'last_name')
+        fields = ('id', 'first_name', 'last_name', 'role')
 
 
 class AuditSheetCommentSerializer(serializers.ModelSerializer):
