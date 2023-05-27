@@ -1,824 +1,576 @@
-import json
+import magic
+from datetime import datetime, timedelta
 
-import requests
-from django.conf import settings
-from django.contrib.auth import password_validation
-from django.contrib.auth.models import Permission
-from django.core.exceptions import ValidationError, ObjectDoesNotExist
-from django.db.models import Q
-from django.utils.timezone import now
-from django.utils.translation import ugettext_lazy as _
+from django.utils import timezone
+from django.db.models import Avg, Q, F, Sum
+
 from rest_framework import serializers
 
-from customer.models import Engineer
-from customer.tasks import user_status_upadte
-from django_keycloak.models import Realm
-from django_keycloak.models import Server
-from fyxt.utils import has_valid_domain_access, get_user_by_email, validators, apply_new_dashboard_job_filter, \
-    dashboard_columns_key_mapping
-from job.models import Job
-from .models import Country, State, City, Category, Company, CompanyAddress, PermissionLabel, Group, User, \
-    EmailVerification, UserSetting, UserView, UserColumn, BaseColumn, Mailbox, CompanyContactType
-from .tasks import send_forgot_password_link, health_checker
+from cqdashboard.models import *
+
+from cqusers.tasks import sizeof_fmt
+from cqusers.models import CqTeam
+
+from cqclient.models import  Department, HealthSystem, Hospital, Insurance, Ehr
+from cqclient.utils import get_health_system_clients, get_hospital_clients, get_department_clients, get_providers_clients
+
+from auditsheet.models import AuditSheet, AuditSheetMetric, AuditHoursMonitor
 
 
-class CountrySerializer(serializers.ModelSerializer):
-    """Serializer for Country details"""
 
-    class Meta:
-        """docstring for Meta"""
-        model = Country
-        fields = ('id', 'name')
+def calulate_avg_completion_time(users):
+    avg_completion_time = AuditHoursMonitor.objects.filter(user__in=users).annotate(duration=F('audit_end_time') - F('audit_start_time')).exclude(duration='00:00:00').aggregate(Avg('duration'))['duration__avg']
+    if avg_completion_time:
+        avg_completion_time /= timedelta(hours=1)
+    else:
+        avg_completion_time = 0
+    return avg_completion_time
 
 
-class StateSerializer(serializers.ModelSerializer):
-    """Serializer for State details"""
-
-    class Meta:
-        """docstring for Meta"""
-        model = State
-        fields = ('id', 'name')
+class ManagerDashboardSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
-        data = super(StateSerializer, self).to_representation(instance=instance)
-        data['name'] = data['name'].title()
-        return data
+        response = super().to_representation(instance)
 
+        result = {}
+        result['id'] = instance.id
+        result['upload_id'] = instance.chart_id
+        result['uploaded_date'] = instance.upload_date
+        result['updated_date'] = instance.chart_updated_date
+        result['archived_date'] = instance.archived_date
 
-class CitySerializer(serializers.ModelSerializer):
-    """Serializer for City details"""
-    state = serializers.CharField(label=_('Tenant'), source='state.name', allow_null=True)
+        # To get sepcialty/department based on hospital_id:
+        if instance.client.user_type == "HEALTH SYSTEM":
+            # TODO::
+            # hospital_id = instance.client.health_system_client.first().hospital_health_system.all().values_list("id", flat=True)
+            hospital_id = None
+        elif instance.client.user_type in ["HOSPITAL", "PHYSICIANS GROUP"]:
+            hospital_id = Hospital.objects.filter(is_active=True, is_deleted=False, spoc=instance.client)
+        elif instance.client.user_type == "DEPARTMENT":
+            hospital_id = Department.objects.filter(is_active=True, is_deleted=False, spoc=instance.client).values_list('hospital_id', flat=True)
+        elif instance.client.user_type == "PROVIDER":
+            hospital_id = Department.objects.filter(is_active=True, is_deleted=False, providers=instance.client).values_list('hospital_id', flat=True)
+
+        if hospital_id:
+            departments = Department.objects.filter(hospital__in=hospital_id, is_active=True, is_deleted=False)
+
+        result['client_name'] = {
+            'id': instance.client.user.id,
+            'first_name': instance.client.user.first_name,
+            'last_name': instance.client.user.last_name,
+            'specialties': [{"id":dept_.specialty.id,  "name": dept_.specialty.name } for dept_ in departments] if hospital_id else []
+        }
+
+        if instance.specialty:
+            result['specialties'] = {
+                'id': instance.specialty.id,
+                'name': instance.specialty.name
+            }
+
+        result['total_page'] = instance.total_pages
+        result['status'] = instance.status
+        result['urgent'] = instance.urgent_flag
+        result['audited_date'] = instance.audited_date 
+
+        if instance.auditor:
+            result['assigned_auditor'] = {
+                'id': instance.auditor.id,
+                'first_name': instance.auditor.first_name,
+                'last_name': instance.auditor.last_name
+            }
+
+        if instance.qa:
+            result['assigned_qa'] = {
+                'id': instance.qa.id,
+                'first_name': instance.qa.first_name,
+                'last_name': instance.qa.last_name
+            }
+
+        if instance.batch_id is None:
+            result['is_splitted'] = True
+
+        try:
+            size = sizeof_fmt(instance.upload_chart.size)
+            mime_type =  magic.from_buffer(instance.upload_chart.read(1024), mime=True)
+            url = instance.upload_chart.url
+        except:
+            size = "0 KB"
+            mime_type = f"application/{instance.upload_chart.name.split('.')[-1]}"
+            url = ""
+
+        result['file_obj'] = {
+            'id': None,
+            'name': instance.upload_chart.name,
+            # 'size': f"{str(round(instance.upload_chart.size / (1024 * 1024), 2))} MB",
+            # 'size1' : f"{math.ceil(instance.upload_chart.size / (1024 * 1024)) } MB",
+            # 'size2' : f"{instance.upload_chart.size / (1024 * 1024)} MB",
+            'size': size,
+            'mime_type': mime_type,
+            'preview_url': url
+        }
+
+        return result
 
     class Meta:
-        """docstring for Meta"""
-        model = City
-        fields = ('id', 'name', 'state')
+        model = Chart
+        fields = '__all__'
+
+
+class ManagerChartUploadSerializer(serializers.ModelSerializer):
 
     def to_representation(self, instance):
-        data = super(CitySerializer, self).to_representation(instance=instance)
-        data['name'] = data['name'].title()
-        return data
-
-
-class CategorySerializer(serializers.ModelSerializer):
-    """Serializer for Country details"""
-
-    class Meta:
-        """docstring for Meta"""
-        model = Category
-        fields = ('id', 'name')
-
-
-class CompanyAddressSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CompanyAddress
-        fields = ('id', 'address', 'country', 'state', 'city', 'zipcode')
-
-    def update(self, instance, validated_data):
-        instance.modified_by = self.context.get('request').user
-        return super().update(instance, validated_data)
-
-
-class CompanySerializer(serializers.ModelSerializer):
-    address = CompanyAddressSerializer(label=_('Address'), required=False)
+        result = {}
+        result['file_obj'] = {}
+        result['file_obj']['id'] = instance.id
+        result['file_obj']['name'] = instance.upload_chart.name
+        # result['file_obj']['size'] =  f"{str(round(instance.upload_chart.size / (1024 * 1024), 2))} MB"
+        # result['file_obj']['size1'] = f"{math.ceil(instance.upload_chart.size / (1024 * 1024)) } MB"
+        # result['file_obj']['size2'] = f"{instance.upload_chart.size / (1024 * 1024)} MB"
+        result['file_obj']['size'] = sizeof_fmt(instance.upload_chart.size),
+        result['file_obj']['mime_type'] = magic.from_buffer(instance.upload_chart.read(1024), mime=True)
+        result['file_obj']['preview_url'] = instance.upload_chart.url
+        return result
 
     class Meta:
-        model = Company
-        fields = ('id', 'name', 'entity_name', 'type', 'ein', 'address', 'is_active')
-
-    def validate_ein(self, ein):
-        if not ein and not ein.isspace():
-            raise serializers.ValidationError(_('Space is not allowed'))
-        return ein
-
-    def update(self, instance, validated_data):
-        if self.context.get('request').user.is_authenticated:
-            instance.modified_by = self.context.get('request').user
-        return super().update(instance, validated_data)
+        model = ChartUpload
+        fields = '__all__'
 
 
-class CheckEmailSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ('email',)
-
-
-class CheckPhoneSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ('phone',)
-
-
-class ValidateTokenSerializer(serializers.Serializer):
-    token = serializers.UUIDField(label=_('Token'))
-
-    def validate_token(self, token):
-        queryset = EmailVerification.objects.filter(token=token, is_verified=False)
-        if not queryset.exists():
-            raise serializers.ValidationError(_('Token expired/Invalid'), code='authorization')
-
-        return token
-
-
-class LoginSerializer(serializers.Serializer):
-    email = serializers.EmailField(label=_('Email'), allow_blank=False)
-    password = serializers.CharField(
-        label=_('Password'),
-        style={'input_type': 'password'},
-        trim_whitespace=False
-    )
-
-    def authenticate(self, **kwargs):
-        # user = get_user_by_email(kwargs.get('email'))
-        email = kwargs.get('email')
-        password = kwargs.get('password')
-        server = Server.objects.first()
-        realm = Realm.objects.first()
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        data = {
-            "client_id": realm.client.client_id,
-            "client_secret": realm.client.secret,
-            "username": email,
-            "password": password,
-            "grant_type": "password"
-        }
-
-        url = f'{server.url}auth/realms/{realm.name}/protocol/openid-connect/token'
-        response = requests.post(url, data=data, headers=headers)
-        response_data = json.loads(response.text)
-        if response.status_code != 200:
-            return None
-        user = User.objects.get(email=email)
-        user.access_token = response_data.get('access_token', '')
-        return user
-
-        # return authenticate(self.context['request'], **kwargs)
-
-    def validate(self, data):
-        email = data.get('email')
-        password = data.get('password')
-
-        if email and password:
-            user = self.authenticate(email=email, password=password)
-
-            if not user:
-                raise serializers.ValidationError({'error': _('Unable to login with provided credentials.')},
-                                                  code='authorization')
-
-            try:
-                if not user.email_verification.is_verified:
-                    raise serializers.ValidationError({'error': _('Your account is not verified yet.')},
-                                                      code='authorization')
-            except ObjectDoesNotExist:
-                raise serializers.ValidationError(
-                    {'error': _('Your account is not verified yet.')},
-                    code='authorization',
-                )
-
-            if user.is_suspended:
-                raise serializers.ValidationError(
-                    {'error': _('User account is suspended. Contact your administrator.')}, code='authorization')
-
-            if not has_valid_domain_access(self.context.get('request'), user):
-                raise serializers.ValidationError(
-                    {'error': _('You do not have a valid domain access. Please contact your account admin.')},
-                    code='authorization')
-
-            if settings.ENVIRONMENT != 'LOCAL':
-                user.last_login = now()
-                user.save()
-
-            return user
-
-
-class PasswordResetSerializer(serializers.Serializer):
-    """
-    Serializer for requesting a password reset e-mail.
-    """
-    email = serializers.EmailField()
-
-    def validate_email(self, email):
-        self.user = get_user_by_email(email, is_active=True)
-        if not self.user:
-            raise serializers.ValidationError(_('The email is not assigned to any user account'))
-
-        return email
-
-    def save(self):
-        send_forgot_password_link.delay(self.user.pk)
-        return self.user.email
-
-
-class GroupSerializer(serializers.ModelSerializer):
-    permissions = serializers.StringRelatedField(many=True, read_only=True)
-    users = serializers.SerializerMethodField(label=_('Users'))
+class SplitAuditSerializer(serializers.ModelSerializer):
 
     class Meta:
-        model = Group
-        fields = ('id', 'name', 'can_view', 'can_add', 'can_approve', 'can_added_job', 'permissions', 'users')
-
-    def validate_name(self, name):
-        validators.unique_together(
-            queryset=Group.objects.filter(name__iexact=name, account=self.context.get('request').tenant,
-                                          is_active=True),
-            instance=self.instance,
-            message=_('Sorry, the name which you have given is exist already!')
-        )
-        return name
-
-    def validate(self, attrs):
-        if not (attrs.get('can_view') or attrs.get('can_add') or attrs.get('can_approve') or attrs.get(
-                'can_added_job')):
-            raise serializers.ValidationError({'error': "You have to select at least one permission to this Role."})
-        return attrs
-
-    def create(self, validated_data):
-        request = self.context.get('request')
-
-        validated_data['created_by'] = request.user
-        validated_data['account'] = request.tenant
-
-        validated_data['permissions'] = self.get_permissions(validated_data)
-
-        return super().create(validated_data)
-
-    def update(self, instance, validated_data):
-        instance.modified_by = self.context.get('request').user
-        validated_data['permissions'] = self.get_permissions(validated_data)
-
-        if 'Follower' not in validated_data['can_added_job']:
-            for x in instance.users.all():
-                for follower in x.followers.all():
-                    follower.followers.remove(x.id)
-        return super().update(instance, validated_data)
-
-    def get_permissions(self, validated_data):
-        values = []
-        if validated_data.get('can_add'):
-            for val in validated_data.get('can_add'):
-                values.extend(
-                    PermissionLabel.objects.filter(is_active=True, type='Add', name=val).values_list('permission',
-                                                                                                     flat=True))
-                values.extend(
-                    PermissionLabel.objects.filter(is_active=True, type='Change', name=val).values_list('permission',
-                                                                                                        flat=True))
-
-        if validated_data.get('can_view'):
-            for val in validated_data.get('can_view'):
-                values.extend(
-                    PermissionLabel.objects.filter(is_active=True, type='View', name=val).values_list('permission',
-                                                                                                      flat=True))
-
-        if validated_data.get('can_approve'):
-            for val in validated_data.get('can_approve'):
-                values.extend(
-                    PermissionLabel.objects.filter(is_active=True, type='Approve', name=val).values_list('permission',
-                                                                                                         flat=True))
-
-        if validated_data.get('can_added_job'):
-            for val in validated_data.get('can_added_job'):
-                values.extend(
-                    PermissionLabel.objects.filter(is_active=True, type='Added_Job', name=val).values_list('permission',
-                                                                                                           flat=True))
-
-        if values:
-            return Permission.objects.filter(codename__in=values).values_list('id', flat=True)
-
-        return []
-
-    def get_users(self, obj):
-        return [{'first_name': user.first_name, 'last_name': user.last_name} for user in
-                obj.users.filter(is_active=True, is_suspended=False)]
+        model = Chart
+        fields = ('chart_id', 'page_number_from', 'page_number_to', 'specialty', 'auditor')
 
 
-class OnboardSerializer(serializers.ModelSerializer):
-    token = serializers.UUIDField(label=_('Token'))
-    password = serializers.CharField(label=_('Password'), max_length=128, write_only=True,
-                                     style={'input_type': 'password'})
-    last_name = serializers.CharField(label=_('Last Name'), max_length=255)
-    recovery_email = serializers.EmailField(label=_('Recovery Email'))
+class TeamMemberSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        all_charts = Chart.objects.filter(is_deleted=False, is_split=False)
+        result = []
+        for member_ in instance.filter(is_active=True, is_deleted=False):
+            member_charts = all_charts.filter(Q(auditor=CqUser.objects.get(id=member_.id)) | Q(qa=CqUser.objects.get(id=member_.id)))
+            result.append(
+                {
+                "id": member_.id,
+                "email": member_.email,
+                "first_name": member_.first_name,
+                "last_name": member_.last_name,
+                "role": member_.role,
+                "open_rebutals": member_charts.filter(status__in=['QA REBUTTAL','CLIENT REBUTTAL']).count(),
+                "active_audits": member_charts.filter(status__in=['AWAITING REVIEW','IN REVIEW','AWAITING AUDIT','IN PROGRESS', 'ON HOLD']).count(),
+                "total_audits": member_charts.count(),  
+                "completed": member_charts.filter(status__in=['ARCHIVED']).count()
+            })
+
+        return result
 
     class Meta:
-        model = User
-        fields = ('token', 'first_name', 'last_name', 'recovery_email', 'phone', 'password')
-
-    def validate_password(self, password):
-        try:
-            password_validation.validate_password(password)
-        except ValidationError as errors:
-            raise serializers.ValidationError(errors)
-
-        return password
-
-    def update(self, instance, validated_data):
-        validated_data.pop('token')
-
-        instance.modified_by = instance
-        instance.is_active = True
-        instance.set_password(validated_data.pop('password'))
-
-        EmailVerification.objects.filter(user=instance).update(is_verified=True, modified_by=instance)
-
-        if instance.category == 'Tenant':
-            tenant = instance.tenant_member.tenant
-            tenant.is_active = True
-            tenant.save()
-            # Todo need to replace value while DEV to QA (https://cc.docker.devapifyxt.com/ to self.context.get('request').url)
-            user_status_upadte.delay(instance.id, 'https://cc.docker.devapifyxt.com/')
-        elif instance.category == 'Vendor':
-            vendor = instance.vendor_member.vendor
-            vendor.is_active = True
-            vendor.save()
-
-        return super().update(instance, validated_data)
+        model = CqUser
 
 
-class UserShortSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ('id', 'first_name', 'last_name', 'email', 'phone')
+class TeamDashboardSerializer(serializers.ModelSerializer):
+    members = TeamMemberSerializer(read_only=True)
+    open_rebutals = serializers.SerializerMethodField()
+    active_audits = serializers.SerializerMethodField()
+    total_audits = serializers.SerializerMethodField()
+    completed = serializers.SerializerMethodField()
+    last_90_assigned = serializers.SerializerMethodField()
+    avg_completion_time = serializers.SerializerMethodField()
+    total_charts = Chart.objects.filter(is_deleted=False, is_split=False)
 
+    def team_members(self, instance):
+        team_members = [members['id'] for members in instance.members.filter(is_active=True, is_deleted=False).values('id')]
+        return team_members
+        # return Chart.objects.filter(auditor__in=instance.members.filter(is_active=True, is_deleted=False), qa__in=instance.members.filter(is_active=True, is_deleted=False))
+    def get_open_rebutals(self, instance):
+        users = self.team_members(instance)
+        open_rebutals = self.total_charts.filter(Q(auditor__in=users) | Q(qa__in=users)).filter(status__in=['QA REBUTTAL','CLIENT REBUTTAL']).count()
+        return open_rebutals
 
-class UserShortSearchSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ('id', 'first_name', 'last_name', 'category', 'photo')
+    def get_active_audits(self, instance):
+        users = self.team_members(instance)
+        active_audits = self.total_charts.filter(Q(auditor__in=users) | Q(qa__in=users)).filter(status__in=['AWAITING REVIEW','IN REVIEW','AWAITING AUDIT','IN PROGRESS', "ON HOLD"]).count()
+        return active_audits
 
+    def get_total_audits(self, instance):
+        users = self.team_members(instance)
+        total_audits = self.total_charts.filter(Q(auditor__in=users) | Q(qa__in=users)).count()
+        return total_audits
 
-class MentionDropDownSerializer(serializers.ModelSerializer):
-    value = serializers.SerializerMethodField(label=_('User Full Name'))
+    def get_completed(self, instance):
+        users = self.team_members(instance)
+        completed = self.total_charts.filter(Q(auditor__in=users) | Q(qa__in=users)).filter(status__in=['ARCHIVED']).count()
+        return completed
+
+    def get_last_90_assigned(self, instance):
+        users = self.team_members(instance)
+        end_date = timezone.now()
+        start_date = timezone.now()-timedelta(days=90)
+        last_90_assigned_count = ChartHistory.objects.filter(user__in = users, chart__is_deleted = False, assigned_date__range = [start_date, end_date]).count()
+        return last_90_assigned_count
+
+    def get_avg_completion_time(self, instance):
+        return f"{round(calulate_avg_completion_time(instance.members.all()), 2)} hrs"
 
     class Meta:
-        model = User
-        fields = ('id', 'value', 'types')
-
-    def get_value(self, obj):
-        return obj.full_name
+        model = CqTeam
+        fields = ('id', 'name', 'members', 'specialties', 'open_rebutals', 'active_audits', 'total_audits', 'completed', 'last_90_assigned', 'avg_completion_time',)
 
 
-class UserDropDownSerializer(serializers.ModelSerializer):
+class TeamSerializer(serializers.ModelSerializer):
+    
+    class Meta:
+        model =CqTeam
+        fields = "__all__"
+
+
+class AuditHoursMonitorSerializer(serializers.ModelSerializer):
 
     class Meta:
-        model = User
-        fields = ('id', 'full_name', 'types')
+        model = AuditHoursMonitor
+        fields = "__all__"
 
 
-class UserShortListSerializer(serializers.ModelSerializer):
-    phone = serializers.SerializerMethodField(label=_('Phone'))
+class HealthSystemSerializer(serializers.ModelSerializer):
 
-    class Meta:
-        model = User
-        fields = ('id', 'first_name', 'last_name', 'email', 'phone')
+    def to_representation(self, instance):
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.name
+        result['prefix'] = instance.prefix
+        result['type'] = instance.type
+        result['address'] = instance.address
+        
+        result['specialty'] = [{"id": specialty['specialty__id'], "name": specialty['specialty__name']}
+                            for specialty in instance.hospital_health_system.filter(is_deleted=False).values('specialty__id', 'specialty__name').filter(~Q(specialty__id=None)).distinct()]
 
-    def get_phone(self, obj):
-        return obj.phone_dict
+        result['insurance'] = [{"id": insurance.id, "name": insurance.name} 
+                            for insurance in instance.insurance.all()]
 
+        result['ehr'] = [{"id": ehr.id, "name": ehr.name}
+                        for ehr in instance.ehr.all()]
 
-class UserSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ('id', 'accounts', 'category', 'types', 'email', 'recovery_email', 'phone', 'first_name', 'last_name',
-                  'gender', 'photo', 'popup', 'is_first_ticket_created', 'is_first_time_login', 'live', 'notes',
-                  'is_suspended', 'is_active')
+        result['account_contacts'] = [
+            {"id": spoc.user.id, "first_name": spoc.user.first_name, 
+            "last_name": spoc.user.last_name, "email": spoc.email, "is_primary":spoc.is_primary, "is_active": spoc.user.is_active} 
+            for spoc in instance.spoc.all()]
 
-    def update(self, instance, validated_data):
-        instance.modified_by = self.context.get('request').user
-        if validated_data.get('photo'):
-            instance.photo.delete(False)
-        return super().update(instance, validated_data)
+        # To get the Client related to health_system and hospital:
+        client_ids = get_health_system_clients(instance.id)
+        if client_ids:
+            # client_user_ids = [user_.id for user_ in CqUser.objects.filter(id__in=list(client_ids), is_active=True, is_deleted=False)]
+            client_user_ids = [user_.id for user_ in CqUser.objects.filter(id__in=list(client_ids), is_deleted=False)]
+            result['active_audits'] = Chart.objects.filter(Q(client__user_id__in=client_user_ids) & Q(is_split=False) & Q(is_deleted=False) & ~Q(batch_id=None) & ~Q(status="ARCHIVED")).count()
+            result['total_audits'] = Chart.objects.filter(Q(client__user_id__in=client_user_ids) & Q(is_split=False) & Q(is_deleted=False) & ~Q(batch_id=None)).count()
 
+        result["hospitals"] = [{"id": hospital.id, "name": hospital.name} for hospital in instance.hospital_health_system.filter(is_deleted=False)]
+        result['is_active'] = instance.is_active
+        result['is_deleted'] = instance.is_deleted
 
-class ChangePasswordSerializer(serializers.ModelSerializer):
-    """
-    Serializer for password change endpoint.
-    """
-    # current_password = serializers.CharField(label='Current Password', write_only=True,
-    #                                          style={'input_type': 'password'})
-    new_password = serializers.CharField(label='New Password', write_only=True, style={'input_type': 'password'})
-    confirm_new_password = serializers.CharField(label='Confirm New Password', write_only=True,
-                                                 style={'input_type': 'password'})
-
-    class Meta:
-        model = User
-        fields = ('new_password', 'confirm_new_password')
-
-    def validate(self, data):
-        if data.get('new_password') != data.get('confirm_new_password'):
-            raise serializers.ValidationError({'confirm_new_password': "Those passwords don't match."})
-
-        try:
-            password_validation.validate_password(data.get('confirm_new_password'))
-        except ValidationError as errors:
-            raise serializers.ValidationError({'confirm_new_password': errors})
-
-        return data
-
-    def update(self, instance, validated_data):
-        instance.set_password(validated_data['confirm_new_password'])
-        instance.modified_by = instance
-        instance.save()
-
-        return instance
-
-
-class UserSettingSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = UserSetting
-        fields = ('id', 'user', 'email_notification_for_new_jobs', 'email_notification_for_job_updates',
-                  'email_notification_for_new_messages',
-                  'email_notification_for_high_priority_job_over_due_by_two_days',
-                  'email_notification_for_job_overdue_by_one_week', 'email_notification_for_emergency_job_created',
-                  'sms_notification_for_new_jobs', 'sms_notification_for_job_updates',
-                  'sms_notification_for_new_messages',
-                  'sms_notification_for_high_priority_job_over_due_by_two_days',
-                  'sms_notification_for_job_overdue_by_one_week', 'sms_notification_for_emergency_job_created',
-                  'push_notification_for_new_jobs', 'push_notification_for_job_updates',
-                  'push_notification_for_new_messages', 'push_notification_for_high_priority_job_over_due_by_two_days',
-                  'push_notification_for_job_overdue_by_one_week', 'push_notification_for_emergency_job_created')
-
-    def update(self, instance, validated_data):
-        instance.modified_by = self.context.get('user')
-        return super().update(instance, validated_data)
-
-
-class UserViewsSerializer(serializers.ModelSerializer):
-    column = serializers.SerializerMethodField(label=_('User Column'))
-    count = serializers.SerializerMethodField(label=_('Count'))
-    is_edit = serializers.SerializerMethodField(label=_('Permission To Edit Column'))
-    reset = serializers.BooleanField(label=_('Reset'), required=False, write_only=True)
+        return result
 
     class Meta:
-        model = UserView
-        fields = (
-            'id', 'view_name', 'make_as_default', 'is_private', 'is_pin', 'is_edit', 'query', 'count', 'column',
-            'reset', 'current_active_tab')
+        model = HealthSystem
+        fields = "__all__"
 
-    def get_column(self, obj):
-        data = []
-        for column in UserColumn.objects.filter(view=obj, is_select=True):
-            if column.column_name == "Actions":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "actions",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
 
-            elif column.column_name == "Assigned Engineers":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "engineers",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+class HealthSystemMembersSerializer(serializers.ModelSerializer):
 
-            elif column.column_name == "Assigned Managers":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "managers",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+    def to_representation(self, instance):
 
-            elif column.column_name == "Assigned To":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "assigned_to",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+        result = {}
+        result['id'] = instance.client.user.id
+        result['first_name'] = instance.client.user.first_name
+        result['last_name'] = instance.client.user.last_name
+        result['email'] = instance.client.user.email
+        result['user_type'] = instance.client.user_type
+        result['is_active'] = instance.client.user.is_active
+        return result
 
-            elif column.column_name == "Associated Emails":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "associated_email",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+    class Meta:
+        model = Chart
 
-            elif column.column_name == "Billable Party":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "billable_party",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
 
-            elif column.column_name == "Brief Description":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "issue_type",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+class HealthSystemHospitalSerializer(serializers.ModelSerializer):
 
-            elif column.column_name == "Category":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "category",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+    def to_representation(self, instance):
 
-            elif column.column_name == "Date Created":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "created_at",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.name
 
-            elif column.column_name == "Followers":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "followers",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+        # client_user_ids = get_hospital_clients(instance.health_system.id)
+        client_user_ids = get_hospital_clients(instance.id)
+        result['active_audits'] = Chart.objects.filter(Q(client__user_id__in=client_user_ids, is_split=False, is_deleted=False) & ~Q(batch_id=None) & ~Q(status__in=["ARCHIVED", "CLIENT REBUTTAL"])).count()
 
-            elif column.column_name == "Job ID":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "id",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+        # To Calculate Chart Accuracy and cq_rev_opp:
+        charts = Chart.objects.filter(is_deleted=False, client__user__id__in=client_user_ids)
+        audit_metrics = AuditSheetMetric.objects.filter(chart_id__in=charts).aggregate(Avg('cq_score'), Sum('outstanding_revenue'))
+        result["chart_accuracy"] = round(audit_metrics['cq_score__avg'] or 0)
+        result["cq_rev_opp"] = round(audit_metrics['outstanding_revenue__sum'] or 0, 2)
+        return result
+                  
+    class Meta:
+        model = Hospital
 
-            elif column.column_name == "Last Activity":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "modified_at",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
 
-            elif column.column_name == "Linked Jobs":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "linked_jobs",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+class HealthSystemHospitalDepartmentSerializer(serializers.ModelSerializer):
 
-            elif column.column_name == "Priority":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "priority",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+    def to_representation(self, instance):
 
-            elif column.column_name == "Property":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "property",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.specialty.name
 
-            elif column.column_name == "Service Location":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "location",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+        client_user_ids = get_hospital_clients(instance.hospital.id)
+        result['active_audits'] = Chart.objects.filter(Q(client__user_id__in=client_user_ids, specialty=instance.specialty, is_split=False, is_deleted=False) & ~Q(batch_id=None) & ~Q(status__in=["ARCHIVED", "CLIENT REBUTTAL"])).count()
 
-            elif column.column_name == "Service Type":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "service_type",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+        # To Calculate Chart Accurancy & cq_rev_opp:        
+        charts = Chart.objects.filter(is_deleted=False, client__user__id__in=client_user_ids, specialty=instance.specialty)
+        audit_metrics = AuditSheetMetric.objects.filter(chart_id__in=charts).aggregate(Avg('cq_score'), Sum('outstanding_revenue'))
+        result["chart_accuracy"] = round(audit_metrics['cq_score__avg'] or 0)
+        result["cq_rev_opp"] = round(audit_metrics['outstanding_revenue__sum'] or 0, 2)
+        return result
 
-            elif column.column_name == "Source Type":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "source",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+    class Meta:
+        model = Department
 
-            elif column.column_name == "Status":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "stage",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
 
-            elif column.column_name == "Target Completion Date":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "target_date",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+class HealthSystemHospitalProvidersSerializer(serializers.ModelSerializer):
 
-            elif column.column_name == "Tenant Contact":
-                data.extend(
-                    [{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "tenant_contact",
-                      'width': column.custom.get('width', '') if column.custom else ''}])
+    def to_representation(self, instance):
 
-            elif column.column_name == "Tenant":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "tenant",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.specialty.name
 
-            elif column.column_name == "Vendor(s)":
-                data.extend([{'id': column.id, 'order': column.order, 'name': column.column_name, 'value': "vendors",
-                              'width': column.custom.get('width', '') if column.custom else ''}])
+        client_user_ids = get_providers_clients(instance.id)
+        # client_user_ids = get_department_clients(instance.hospital.health_system.id)
+        result['active_audits'] = Chart.objects.filter(Q(client__user_id__in=client_user_ids, is_split=False, is_deleted=False) & ~Q(batch_id=None) & ~Q(status__in=["ARCHIVED", "CLIENT REBUTTAL"])).count()
 
-        return data
+        # To Calculate Chart Accurancy:
+        chart_ids = set([chart.id for chart in Chart.objects.filter(Q(client__user_id__in=client_user_ids) & Q(is_split=False) & Q(is_deleted=False) & ~Q(batch_id=None) & Q(status__in=["ARCHIVED", "CLIENT REBUTTAL"]))])
+        chart_accuracy = AuditSheetMetric.objects.filter(chart_id__in=list(chart_ids)).aggregate(Avg('cq_score'))['cq_score__avg']
+        result["chart_accuracy"] = round(chart_accuracy, 2) if chart_accuracy else 0
 
-    def get_count(self, obj):
-        user = self.context.get('user')
-        if user.category == 'Customer':
-            if 'Owner' in user.types:
-                queryset = Job.objects.select_related('category', 'property', 'tenant__company').filter(is_active=True)
-            elif 'Manager' in user.types:
-                queryset = Job.objects.select_related('category', 'property', 'tenant__company').filter(is_active=True,
-                                                                                                        property__managers__user=user)
-            elif 'Engineer' in user.types:
-                if Engineer.objects.filter(user_id=user.id, primary_contact=True):
-                    queryset = Job.objects.select_related('category', 'property', 'tenant__company').filter(
-                        property__engineers__user=user, is_active=True).distinct()
-                else:
-                    queryset = Job.objects.select_related('category', 'property', 'tenant__company').filter(
-                        Q(engineers=user) | Q(created_by=user), is_active=True).distinct()
-        elif user.category == 'Tenant':
-            queryset = Job.objects.select_related('category', 'property', 'tenant__company').filter(is_active=True,
-                                                                                                    tenant__company=user.tenant_member.tenant.company)
+        # To Calculate cq_rev_opp:
+        cq_rev_opp = AuditSheetMetric.objects.filter(chart_id__in=list(chart_ids)).aggregate(Sum("outstanding_revenue")).get("outstanding_revenue__sum")
+        result["cq_rev_opp"] = round(cq_rev_opp, 2) if cq_rev_opp else None
+        return result
 
-        if obj.view_name not in ['Assigned To Me', 'Unassigned', 'New Requests', 'Tenant Responsible', 'Requires Attention', 'My Properties']:
-            return apply_new_dashboard_job_filter(queryset, _filter='All Open Jobs', user=user).count()
+    class Meta:
+        model = Department
+
+
+class HealthSystemTeamStatisticsSerializer(serializers.ModelSerializer):
+
+    def chart_queryset(self, instance):
+        return Chart.objects.filter(is_deleted=False) # Q(is_split=False) & ~Q(batch_id=None))
+
+    def to_representation(self, instance):
+
+        result = {}
+        result['id'] = instance.id
+
+        if self.context['request'].query_params.get('health_system_id'):
+            result['name'] = instance.name
+            client_ids = get_health_system_clients(instance.id)
+
+        elif self.context['request'].query_params.get('hospital_id'):
+            result['name'] = instance.name
+            client_ids = get_hospital_clients(instance.id)
+
+        elif self.context['request'].query_params.get('department_id'):
+            result['name'] = instance.specialty.name
+            client_ids = get_department_clients(instance.id)
+
+        elif self.context['request'].query_params.get('provider_id'):
+            result['name'] = instance.specialty.name
+            client_ids = get_providers_clients(instance.id)
+
+        client_user_ids = [user_.id for user_ in CqUser.objects.filter(id__in=list(client_ids), is_active=True, is_deleted=False)]
+        result['total_audits'] = self.chart_queryset(instance).filter(client__user_id__in=client_user_ids).count()
+        result['in_progress'] = self.chart_queryset(instance).filter(client__user_id__in=client_user_ids, status__in=['AWAITING REVIEW','IN REVIEW','AWAITING AUDIT','IN PROGRESS', 'AWAITING ASSIGNMENT', 'ON HOLD']).count()
+        result['completed'] = self.chart_queryset(instance).filter(client__user_id__in=client_user_ids, status="ARCHIVED").count()
+        result['open_rebuttals'] = self.chart_queryset(instance).filter(client__user_id__in=client_user_ids, status__in=['QA REBUTTAL','CLIENT REBUTTAL']).count()
+
+        return result
+
+    class Meta:
+        model = HealthSystem
+
+
+class HospitalAccountsSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.name
+        result['address'] = instance.address
+        result['patients_per_month'] = instance.patients_per_month
+        result['health_system'] = instance.health_system.id
+        result['prefix'] = instance.health_system.prefix if instance.health_system.prefix else "CHPRE"
+        result['department'] = [{"id": department.id, "name": department.specialty.name} 
+                            for department in instance.department_hospital.filter(is_deleted=False)]
+
+        result['insurance'] = [{"id": insurance.id, "name": insurance.name} 
+                            for insurance in instance.insurance.all()]
+
+        result['ehr'] = [{"id": ehr.id, "name": ehr.name}
+                        for ehr in instance.ehr.all()]
+
+        result['specialty'] = [{"id": department.specialty.id, "name": department.specialty.name}
+                            for department in instance.department_hospital.filter(is_deleted=False)]
+
+        result['account_contacts'] = [
+            {"id": spoc.user.id, "first_name": spoc.user.first_name, 
+            "last_name": spoc.user.last_name, "email": spoc.email, "is_primary":spoc.is_primary} 
+            for spoc in instance.spoc.all()]
+
+        result['is_active'] = instance.is_active
+        return result
+
+    class Meta:
+        model = Hospital
+        fields = "__all__"
+
+
+class DepartmentSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.specialty.name
+        result['address'] = instance.hospital.address if instance.hospital else None
+        result['patients_per_month'] = instance.hospital.patients_per_month if instance.hospital else None
+        # result['physician'] = [{"id":provider.id, "first_name":provider.user.first_name, "last_name":provider.user.last_name} for provider in instance.providers.all()]
+        if instance.hospital:
+            result['insurance'] = [
+                {"id": insurance.id, "name": insurance.name} 
+                for insurance in instance.hospital.insurance.all() 
+                ]
+
+            result['ehr'] = [
+                {"id": ehr.id, "name": ehr.name} 
+                for ehr in instance.hospital.ehr.all() if instance.hospital
+                ]
         else:
-            return apply_new_dashboard_job_filter(queryset, _filter=obj.view_name, user=user).count()
+            result['insurance'] = None
+            result['ehr'] = None
 
-    def get_is_edit(self, obj):
-        user = self.context.get('user')
-        return False if obj.created_by is None and obj.is_private is False or obj.user != user else True
+        result['account_contacts'] = [
+        {'id': spoc_['user__id'], 'email': spoc_['user__email'], 'first_name': spoc_['user__first_name'], 'last_name': spoc_['user__last_name'], 'is_primary': spoc_['user__client__is_primary']} 
+        for spoc_ in instance.spoc.values('user__id', 'user__email', 'user__first_name', 'user__last_name', 'user__client__is_primary')
+        ]
 
-    def validate_is_pin(self, is_pin):
-        user = self.context.get('user')
-        user_view = UserView.objects.filter(id=self.instance.id, created_by__isnull=False, is_private=False)
-
-        if is_pin is True and UserView.objects.filter(user=user, is_pin=True).count() >= 5:
-            raise serializers.ValidationError(_(f'You can\'t pin more than 5 views'))
-
-        if user_view and is_pin is True and user_view[0].created_by != user:
-            raise serializers.ValidationError(
-                _(f'You can\'t pin others\' template views. Save as new to pin a view.'))
-
-        return is_pin
-
-    def validate_view_name(self, view_name):
-        user = self.context.get('user')
-
-        if UserView.objects.filter(user=user, view_name=view_name):
-            raise serializers.ValidationError(_(f'"{view_name}" is already exists!'))
-
-        return view_name
-
-    def create(self, validated_data):
-        user = self.context.get('user')
-        validated_data['created_by'] = user
-        validated_data['user'] = user
-
-        column_list = ['Job ID', 'Last Activity', 'Property', 'Brief Description', 'Category', 'Priority', 'Actions',
-                       'Service Location', 'Assigned Managers', 'Assigned Engineers', 'Date Created', 'Status',
-                       'Service Type', 'Linked Jobs', 'Source Type']
-
-        if lists := self.context.get('columns', None):
-            view = super().create(validated_data)
-            for column in BaseColumn.objects.all():
-                if column.column_name in lists:
-                    UserColumn.objects.create(view=view, order=lists.index(column.column_name) + 1,
-                                              column_name=column.column_name, is_select=True)
-                else:
-                    UserColumn.objects.create(view=view, order=0, column_name=column.column_name)
-            return view
-
-        view = super().create(validated_data)
-
-        # Add a default columns to this view
-        for column in BaseColumn.objects.all():
-            if column.column_name in column_list:
-                UserColumn.objects.create(view=view, order=column_list.index(column.column_name) + 1,
-                                          column_name=column.column_name, is_select=True)
-            else:
-                UserColumn.objects.create(view=view, order=0, column_name=column.column_name)
-
-        return view
-
-    def update(self, instance, validated_data):
-        user = self.context.get('user')
-        instance.modified_by = user
-
-        queryset = UserView.objects.filter(user=user)
-        if validated_data.get('is_pin') is True and queryset.filter(is_pin=True).count() == 0:
-            instance.make_as_default = True
-            self._extracted_from_update(queryset, user)
-        if validated_data.get('make_as_default') is True:
-            self._extracted_from_update(queryset, user)
-        if validated_data.get('current_active_tab') is True:
-            queryset.update(current_active_tab=False)
-            instance.current_active_tab = True
-            instance.modified_by = user
-
-        if validated_data.get('query'):
-            instance.query = validated_data.get('query')
-
-        if validated_data.get('reset'):
-            if rest := validated_data.pop('reset'):
-                if rest is True:
-                    instance.query = None
-
-        return super().update(instance, validated_data)
-
-    def _extracted_from_update(self, queryset, user):
-        view = queryset.get(make_as_default=True)
-        view.make_as_default = False
-        view.modified_by = user
-        view.save()
-
-
-class UserColumnsSerializer(serializers.ModelSerializer):
-    value = serializers.SerializerMethodField(label=_('User Column'))
+        result['is_active'] = instance.is_active
+        return result
 
     class Meta:
-        model = UserColumn
-        fields = ('id', 'order', 'column_name', 'is_select', 'value')
 
-    def get_value(self, obj):
-        return dashboard_columns_key_mapping(obj)
+        model = Department
+        fields = "__all__"
 
-    def update(self, instance, validated_data):
-        instance.modified_by = self.context.get('user')
-        return super().update(instance, validated_data)
+class ProviderSerializer(serializers.ModelSerializer):
 
-
-# Version 2 Dashboard view
-class UserDashboardViewSerializer(serializers.ModelSerializer):
-
-    class Meta:
-        model = UserView
-        fields = (
-            'id', 'view_name', 'make_as_default', 'is_private', 'is_pin', 'query',
-            'current_active_tab', 'is_standard', 'view_type')
-
-    def validate_view_name(self, view_name):
-        user = self.context.get('user')
-
-        if UserView.objects.filter(user=user, view_name=view_name):
-            raise serializers.ValidationError(_(f'"{view_name}" is already exists!'))
-
-        return view_name
-
-    def create(self, validated_data):
-        user = self.context.get('user')
-        validated_data['created_by'] = user
-        validated_data['user'] = user
-
-        column_list = ['Job ID', 'Last Activity', 'Property', 'Brief Description', 'Category', 'Priority', 'Actions',
-                       'Service Location', 'Assigned Managers', 'Assigned Engineers', 'Date Created', 'Status',
-                       'Service Type', 'Linked Jobs', 'Source Type']
-
-        if lists := self.context.get('columns', None):
-            view = super().create(validated_data)
-            for column in BaseColumn.objects.all():
-                if column.column_name in lists:
-                    UserColumn.objects.create(view=view, order=lists.index(column.column_name) + 1,
-                                              column_name=column.column_name, is_select=True)
-                else:
-                    UserColumn.objects.create(view=view, order=0, column_name=column.column_name)
-            return view
-
-        view = super().create(validated_data)
-
-        # Add a default columns to this view
-        for column in BaseColumn.objects.all():
-            if column.column_name in column_list:
-                UserColumn.objects.create(view=view, order=column_list.index(column.column_name) + 1,
-                                          column_name=column.column_name, is_select=True)
-            else:
-                UserColumn.objects.create(view=view, order=0, column_name=column.column_name)
-
-        return view
-
-    def update(self, instance, validated_data):
-        user = self.context.get('user')
-        instance.modified_by = user
-
-        queryset = UserView.objects.filter(user=user)
-
-        if validated_data.get('is_pin') is False and instance.make_as_default is True:
-            instance.make_as_default = False
-            view = queryset.get(view_name='All Open Jobs')
-            view.make_as_default = True
-            view.modified_by = user
-            view.save()
-
-        if validated_data.get('make_as_default') is True:
-            queryset.update(make_as_default=False)
-            instance.make_as_default = True
-            instance.is_pin = True
-            instance.modified_by = user
-
-        if validated_data.get('current_active_tab') is True:
-            queryset.update(current_active_tab=False)
-            instance.current_active_tab = True
-            instance.modified_by = user
-
-        if validated_data.get('query'):
-            instance.query = validated_data.get('query')
-
-        return super().update(instance, validated_data)
-
-
-class UserDashboardViewColumnsSerializer(serializers.ModelSerializer):
-    name = serializers.CharField(label=_('Column Name'), source='column_name')
-    checked = serializers.SerializerMethodField(label=_('Created By'))
-    class Meta:
-        model = UserColumn
-        fields = ('id', 'order', 'name', 'checked')
-
-    def get_checked(self, obj):
-        return obj.is_select
-
-
-class HealthSerializer(serializers.Serializer):
-    health = serializers.CharField(label=_('health'))
-
-    def create(self, validated_data):
-        health_ratio = health_checker(health=validated_data.pop('health'))
-        return {"health": str(health_ratio)}
-
-
-class MailboxSerializer(serializers.ModelSerializer):
-    """Serializer for Mailbox details"""
-    created_by = serializers.SerializerMethodField(label=_('Created By'))
-
-    class Meta:
-        """docstring for Meta"""
-        model = Mailbox
-        fields = (
-        'id', 'name', 'preferred_tz', 'host', 'email', 'password', 'port', 'use_tls', 'primary', 'type', 'redirect_url', 'created_by')
-        extra_kwargs = {'account': {'write_only': True}, 'password': {'write_only': True},
-                        'port': {'write_only': True}, 'use_tls': {'write_only': True},
-                        'primary': {'write_only': True}, 'type': {'write_only': True},
-                        'host': {'write_only': True}, 'redirect_url': {'write_only': True}, }
-
-    def create(self, validated_data):
-        request = self.context.get('request')
-        validated_data['created_by'] = request.user
-        validated_data['account'] = request.tenant
-        return super().create(validated_data)
-
-    def get_created_by(self, obj):
-        return obj.created_by.short_profile_dict() if obj.created_by else None
-
-
-class CompanyContactTypeSerializer(serializers.ModelSerializer):
-    """Serializer for Company Contact Types details"""
-    class Meta:
-        """docstring for Meta"""
-        model = CompanyContactType
-        fields = ('id', 'name')
     def to_representation(self, instance):
-        data = super(CompanyContactTypeSerializer, self).to_representation(instance=instance)
-        # data['name'] = data['name'].title()
-        return data
+        result = {}
+        result["id"] = instance.id
+        result["first_name"] = instance.user.first_name
+        result["last_name"] = instance.user.last_name
+        result['is_active'] = instance.is_approved
+        result["email"] = instance.user.email
+        return result
+
+    class Meta:
+        model = Client
+        fields = "__all__"
+
+class InsuranceSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Insurance
+        fields = "__all__"
+
+
+class EhrSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Ehr
+        fields = "__all__"
+
+
+class HospitalDepartmentDropDownSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        result = {
+            'id': instance.id,
+            'name': instance.name,
+            # 'hospital': instance.hospital.id if instance.hospital else None,
+        }
+
+        # if instance.hospital:
+        #     result ['health_system'] = instance.hospital.health_system.id if instance.hospital.health_system else None
+        # else:
+        #     result ['health_system'] = None
+
+        if instance.department_specialty.values('hospital'):
+            for id_ in instance.department_specialty.values('hospital'):
+                result['hospital'] = id_['hospital']
+
+        else:
+            result['hospital'] = None
+
+        if instance.department_specialty.values('hospital__health_system__id'):
+            for id_ in instance.department_specialty.values('hospital__health_system__id'):
+                result['health_system'] = id_['hospital__health_system__id']
+
+        else:
+            result ['health_system'] = None
+
+        return result
+
+    class Meta:
+        model = Department
+
+
+class HealthSystemValidationSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = HealthSystem
+        fields = ('id', 'name', 'prefix')
+
+
+class HospitalValidationSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Hospital
+        fields = ('id', 'name')
+
+
+class DepartmentValidationSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        result = {}
+        result['id'] = instance.id
+        result['name'] = instance.specialty.name
+        return result
+
+
+    class Meta:
+        model = Department
+
+
+class MemberListSerializer(serializers.ModelSerializer):
+
+    def to_representation(self, instance):
+        result = {}
+        result['id'] = instance.id
+        result['first_name'] = instance.first_name
+        result['last_name'] = instance.last_name
+        result['email'] = instance.email
+        result['role'] = instance.role
+        result['name'] = f"{instance.first_name} {instance.last_name}"
+        result['specialty'] = instance.specialties.values_list('name', flat=True).filter(id__in=self.context['specialties_ids'])
+        return result
